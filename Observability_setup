@@ -1,0 +1,2153 @@
+USE ROLE accountadmin;
+GRANT EXECUTE TASK, EXECUTE MANAGED TASK ON ACCOUNT TO ROLE SYSADMIN WITH GRANT OPTION;
+GRANT CREATE REPLICATION GROUP ON ACCOUNT TO ROLE SYSADMIN WITH GRANT OPTION;
+GRANT CREATE INTEGRATION ON ACCOUNT TO ROLE SYSADMIN WITH GRANT OPTION;
+GRANT EXECUTE ALERT ON ACCOUNT TO ROLE SYSADMIN WITH GRANT OPTION;
+GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE SYSADMIN;
+CREATE ROLE IF NOT EXISTS OBSERVABILITY_ADMIN_2; --DROP ROLE OBSERVABILITY_ADMIN_2
+
+SHOW GRANTS TO ROLE SYSADMIN ;
+
+USE ROLE SYSADMIN;
+USE WAREHOUSE COMPUTE_WH;
+
+
+/*Refactored and V2*/
+
+--serial:1 (code block A): CREATE DATABASES & SCHEMAS 
+
+-- Create the necessary databases and schemas 
+
+SET dbname = (SELECT CURRENT_ACCOUNT()|| '_OBSERVABILITY_METRICS');  --change this to change DB name
+CREATE or REPLACE DATABASE IDENTIFIER($dbname);
+
+--Create all Schemas
+SET schemaSetupProcedure = (SELECT $dbname||'.SETUP_PROCEDURES_V1');
+CREATE SCHEMA IF NOT EXISTS IDENTIFIER($schemaSetupProcedure);
+
+SET schemaVersionConfig = (SELECT $dbname||'.VERSION_CONFIG');
+CREATE SCHEMA IF NOT EXISTS IDENTIFIER($schemaVersionConfig);
+
+-- Create the logging schema
+SET schemaLoggingSchema = (SELECT $dbname||'.LOGGING_SCHEMA');
+CREATE SCHEMA IF NOT EXISTS IDENTIFIER($schemaLoggingSchema); 
+
+-- Create the OBSERVABILITY_CORE schema
+SET schemaObservabilityCoreSchema = (SELECT $dbname||'.OBSERVABILITY_CORE');
+CREATE SCHEMA IF NOT EXISTS IDENTIFIER($schemaObservabilityCoreSchema);
+
+-- Create the version by account table 
+
+SET TableVersion_by_Account = (SELECT $schemaVersionConfig||'.VERSION_BY_ACCOUNT');
+CREATE TABLE IF NOT EXISTS IDENTIFIER($TableVersion_by_Account) ( 
+    ACCOUNT_LOCATOR VARCHAR, 
+    OBSERVABILITY_VERSION VARCHAR 
+  ); 
+
+
+-- Create the logging table 
+
+SET TableLoggingTable = (SELECT $schemaLoggingSchema||'.LOGGING_TABLE');
+CREATE TRANSIENT TABLE IF NOT EXISTS IDENTIFIER($TableLoggingTable) ( 
+    PROCEDURE_NAME VARCHAR, 
+    STATUS VARCHAR, 
+    DESC VARCHAR, 
+    ACCOUNT VARCHAR 
+  );
+
+
+--serial:2 (code block B): CHILD ROLE CREATION
+
+
+SET ProcCHILD_ROLE_CREATION = (SELECT $schemaSetupProcedure||'.CHILD_ROLE_CREATION');
+
+CREATE OR REPLACE PROCEDURE IDENTIFIER($ProcCHILD_ROLE_CREATION)()
+      RETURNS STRING
+      LANGUAGE JAVASCRIPT
+      EXECUTE AS CALLER
+    AS
+    $$
+
+      var version_schema = "SETUP_PROCEDURES_V1"; 
+      var costing_db_name = "OBSERVABILITY_METRICS";
+
+      var account_query = "SELECT CURRENT_ACCOUNT()||'_OBSERVABILITY_METRICS'";
+      var statement = snowflake.createStatement({sqlText: account_query});
+      var account = statement.execute()
+      account.next();
+      account_name = account.getColumnValue(1);
+
+      var query_user = "SELECT CURRENT_USER()";
+      var statement0 = snowflake.createStatement({sqlText: query_user});
+      var user = statement0.execute()
+      user.next();
+      username = user.getColumnValue(1);
+
+      var sql_query = `
+      BEGIN
+      ---- CREATE OBSERVABILITY_ADMIN ROLE
+      -- CREATE THE ROLE AND CORRESPONDING WAREHOUSE TO BE USED
+      
+      CREATE ROLE IF NOT EXISTS OBSERVABILITY_ADMIN;
+      CREATE WAREHOUSE IF NOT EXISTS OBSERVABILITY_WH WITH WAREHOUSE_SIZE = XSMALL;
+      GRANT USAGE ON WAREHOUSE OBSERVABILITY_WH TO ROLE OBSERVABILITY_ADMIN;
+      GRANT USAGE ON WAREHOUSE OBSERVABILITY_WH TO ROLE SYSADMIN;
+
+      -- GRANT ROLE TO ALL PARENT ROLES WHO MAY NEED TO SEE OUTPUTS OF OBSERVABILITY OBJECTS
+      GRANT ROLE OBSERVABILITY_ADMIN TO USER "` + username + `";
+      GRANT ROLE OBSERVABILITY_ADMIN TO ROLE SYSADMIN;
+      GRANT ROLE OBSERVABILITY_ADMIN TO ROLE ACCOUNTADMIN;
+
+      -- GRANT USAGE ON ALL OBJECTS BEING SHARED  --refactor
+      GRANT USAGE ON DATABASE `+ account_name +` TO ROLE OBSERVABILITY_ADMIN;
+      GRANT USAGE ON SCHEMA ` + account_name + `.LOGGING_SCHEMA TO ROLE OBSERVABILITY_ADMIN;
+      GRANT SELECT, INSERT ON TABLE ` + account_name + `.LOGGING_SCHEMA.LOGGING_TABLE TO ROLE OBSERVABILITY_ADMIN;
+      GRANT USAGE ON DATABASE ` + account_name + ` TO ROLE OBSERVABILITY_ADMIN;
+      GRANT USAGE ON SCHEMA ` + account_name + `.${version_schema} TO ROLE OBSERVABILITY_ADMIN;
+      GRANT USAGE ON SCHEMA ` + account_name + `.VERSION_CONFIG TO ROLE OBSERVABILITY_ADMIN;
+      GRANT SELECT, INSERT ON TABLE ` + account_name + `.VERSION_CONFIG.VERSION_BY_ACCOUNT TO OBSERVABILITY_ADMIN;
+      GRANT USAGE ON ALL PROCEDURES IN SCHEMA ` + account_name + `.${version_schema} TO ROLE OBSERVABILITY_ADMIN;
+      GRANT USAGE ON FUTURE PROCEDURES IN SCHEMA ` + account_name + `.${version_schema} TO ROLE OBSERVABILITY_ADMIN;
+
+
+      -- GRANT THE ABILITY TO CREATE ALL REQUIRED OBJECTS (DBS, SCHEMAS, TABLES, TASKS, ALERTS AND NOTIFICATIONS)
+      GRANT CREATE DATABASE ON ACCOUNT TO ROLE OBSERVABILITY_ADMIN;
+      GRANT CREATE REPLICATION GROUP ON ACCOUNT TO ROLE OBSERVABILITY_ADMIN;
+      GRANT EXECUTE MANAGED TASK, EXECUTE TASK ON ACCOUNT TO ROLE OBSERVABILITY_ADMIN;
+      GRANT CREATE INTEGRATION ON ACCOUNT TO ROLE OBSERVABILITY_ADMIN;
+      GRANT EXECUTE ALERT ON ACCOUNT TO ROLE OBSERVABILITY_ADMIN;
+      GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE OBSERVABILITY_ADMIN;
+
+      ---- CREATE OBSERVABILITY_ADMIN ROLE
+
+      INSERT INTO ` + account_name + `.LOGGING_SCHEMA.LOGGING_TABLE
+      VALUES ('CHILD_ROLE_CREATION','SUCCESS', CURRENT_TIMESTAMP(), '`+account_name+`');
+      RETURN 'SUCCESS';
+      EXCEPTION
+          WHEN statement_error THEN
+          LET ERROR_MESSAGE := CURRENT_TIMESTAMP()||SQLCODE || ': '||SQLERRM;
+          INSERT INTO ` + account_name + `.LOGGING_SCHEMA.LOGGING_TABLE
+          VALUES('child_role_creation','FAILED', :ERROR_MESSAGE ,'`+account_name+`');
+          USE ROLE SYSADMIN;
+          USE WAREHOUSE COMPUTE_WH;
+          RETURN OBJECT_CONSTRUCT('ERROR TYPE','STATEMENT_ERROR',
+                                      'SQLCODE', sqlcode,
+                                      'SQLERRM' , sqlerrm,
+                                      'SQLSTATE', sqlstate);
+      
+      END`;
+      var statement1 = snowflake.createStatement({sqlText: sql_query});
+      //return statement1.getSqlText();
+      var result = statement1.execute();
+  
+  $$;
+
+  
+CALL IDENTIFIER($ProcCHILD_ROLE_CREATION)();
+
+-- 2b : Check the Log -- Schema name differs by Snowflake Account - CUSTOMIZE 
+
+SELECT * FROM JSA18243_OBSERVABILITY_METRICS.LOGGING_SCHEMA.LOGGING_TABLE;
+
+--serial:3 (code block C): Database and Schema Creation
+/*Approx Runtime on Call:  01 mins*/
+
+/*if running below code-block gives error , run SET schemaSetupProcedure query again in Code-Block-1 to set the variable*/
+SET ProcCHILD_DB_SCHEMA_TABLE_STANDUP = (SELECT $schemaSetupProcedure||'.CHILD_DB_SCHEMA_TABLE_STANDUP');
+
+CREATE OR REPLACE PROCEDURE IDENTIFIER($ProcCHILD_DB_SCHEMA_TABLE_STANDUP)()
+      RETURNS VARCHAR(16777216)
+      LANGUAGE JAVASCRIPT
+      EXECUTE AS CALLER
+    AS 
+    $$
+      var db_base_name = "_OBSERVABILITY_METRICS"; 
+      var schema_base_name = "OBSERVABILITY_CORE";
+      var schema_base_name_costing = "SNOWFLAKE_COST_STD";
+      var table_base_name = "OBSERVABILITY_METRICS";
+
+      var warehouse_query = "USE WAREHOUSE OBSERVABILITY_WH";
+      var wh_statement = snowflake.createStatement({sqlText: warehouse_query});
+      var warehouse_execute = wh_statement.execute();
+      
+
+      var account_query = "SELECT CURRENT_ACCOUNT()";
+      var statement0 = snowflake.createStatement({sqlText: account_query});
+      var account = statement0.execute();
+      account.next();
+      account_name = account.getColumnValue(1);
+      
+      var query_db = `SELECT '`+ account_name + db_base_name + `'`;
+      var statement1 = snowflake.createStatement({sqlText: query_db});
+      var db = statement1.execute();
+      db.next();
+      db_name = db.getColumnValue(1);
+      
+      var query_schema = `SELECT '` + account_name + db_base_name +`.`+ schema_base_name + `'`;
+      var statement2 = snowflake.createStatement({sqlText: query_schema});
+      var schema = statement2.execute();
+      schema.next();
+      schema_name = schema.getColumnValue(1);
+
+      var query_table = `SELECT '` + account_name + db_base_name +`.`+ schema_base_name +`.`+ table_base_name+ `'`;
+      var statement3 = snowflake.createStatement({sqlText: query_table});
+      var table = statement3.execute();
+      table.next();
+      table_name = table.getColumnValue(1);
+      
+      var warehouse_execute = wh_statement.execute();
+      
+      var sql_query = `
+        BEGIN
+        
+
+        CREATE OR REPLACE TABLE ` + table_name + ` (
+        ACCOUNT VARCHAR(16777216),
+    	METRICNAME VARCHAR(16777216),
+    	TIMESTAMP TIMESTAMP_NTZ(9),
+    	DESCRIPTION VARCHAR(16777216),
+    	QUERYID VARCHAR(16777216),
+    	DATATRANSFER FLOAT,
+    	TOTALCOST FLOAT,
+    	COMPUTECOST FLOAT,
+    	STORAGECOST FLOAT,
+    	LONGRUNNINGQUERY VARCHAR(16777216),
+    	TOPWAREHOUSE ARRAY,
+    	TOPUSER ARRAY,
+    	TOPROLE ARRAY,
+    	QUERYTIMEOUT VARCHAR(16777216),
+    	TASKCREDITS VARCHAR(16777216),
+    	WAREHOUSEPROVISION VARCHAR(16777216),
+    	QUERYQUEUEING VARCHAR(16777216),
+    	WAREHOUSEREPAIR VARCHAR(16777216),
+    	SERVICEACCOUNT VARCHAR(16777216),
+    	ADMINLOGIN VARCHAR(16777216),
+    	UNUSEDROLE VARCHAR(16777216),
+    	NOTALLOWEDUSER VARCHAR(16777216)
+        );
+
+        ALTER TABLE ` + table_name + ` SET CHANGE_TRACKING = TRUE;
+
+        CREATE TABLE IF NOT EXISTS ` + schema_name +`.ALLOWED_USERADMINS (
+          ACCOUNT VARCHAR,
+          USERNAME VARCHAR,
+          ROLE VARCHAR
+        );
+        
+        INSERT INTO ` + db_name + `.LOGGING_SCHEMA.LOGGING_TABLE
+        VALUES ('CHILD_DB_SCHEMA_TABLE_STANDUP','SUCCESS', CURRENT_TIMESTAMP(), '`+account_name+`');
+        RETURN 'SUCCESS';
+        EXCEPTION
+          WHEN statement_error THEN
+            LET ERROR_MESSAGE := CURRENT_TIMESTAMP()||SQLCODE || ': '||SQLERRM;
+            INSERT INTO ` + db_name + `.LOGGING_SCHEMA.LOGGING_TABLE
+            VALUES('CHILD_DB_SCHEMA_TABLE_STANDUP','FAILED', :ERROR_MESSAGE ,'`+account_name+`');
+            USE ROLE SYSADMIN;
+            USE WAREHOUSE COMPUTE_WH;
+           
+            RETURN OBJECT_CONSTRUCT('ERROR TYPE','STATEMENT_ERROR',
+                                        'SQLCODE', sqlcode,
+                                        'SQLERRM' , sqlerrm,
+                                        'SQLSTATE', sqlstate);
+        END`;
+        
+      var statement4 = snowflake.createStatement({sqlText: sql_query});
+      var result = statement4.execute();
+      
+      var kh_query = `
+        BEGIN
+        
+        CREATE SCHEMA IF NOT EXISTS ` + db_name + `.`+ schema_base_name_costing + `;
+        
+        create TABLE if not exists ` + db_name + `.`+ schema_base_name_costing + `.DAILY_STAGE_STORAGE (
+          ACCOUNT_NAME VARCHAR(16777216),
+          USAGE_DATE DATE,
+          AVERAGE_STAGE_BYTES NUMBER(38,6)
+        );
+        
+        CREATE  TABLE IF NOT EXISTS ` + db_name + `.`+ schema_base_name_costing + `.DB_STORAGE_CALC (
+          USAGE_DATE DATE,
+          DATABASE_NAME VARCHAR(16777216),
+          DATABASE_STORAGE_PETABYTES FLOAT,
+          FAILSAFE_STORAGE_PETABYTES FLOAT,
+          HYBRID_STORAGE_PETABYTES FLOAT,
+          ACCOUNT_NAME VARCHAR(16777216)
+        );
+
+        CREATE TRANSIENT TABLE IF NOT EXISTS ` + db_name + `.`+ schema_base_name_costing + `.SF_CREDITS_BY_QUERY_NEW (
+          ACCOUNT_NAME VARCHAR(16777216),
+          QUERY_ID VARCHAR(16777216),
+          START_SLICE TIMESTAMP_LTZ(0),
+          ADJUSTED_START_TIME TIMESTAMP_LTZ(6),
+          START_TIME TIMESTAMP_LTZ(6),
+          END_TIME TIMESTAMP_LTZ(6),
+          QUERY_TYPE VARCHAR(16777216),
+          QUERY_TEXT VARCHAR(16777216),
+          QUERY_TAG VARCHAR(16777216),
+          BYTES_SPILLED_TO_LOCAL_STORAGE NUMBER(38,0),
+          BYTES_SPILLED_TO_REMOTE_STORAGE NUMBER(38,0),
+          DATABASE_ID NUMBER(38,0),
+          DATABASE_NAME VARCHAR(16777216),
+          SCHEMA_NAME VARCHAR(16777216),
+          SESSION_ID NUMBER(38,0),
+          USER_NAME VARCHAR(16777216),
+          ROLE_NAME VARCHAR(16777216),
+          WAREHOUSE_NAME VARCHAR(16777216),
+          WAREHOUSE_ID NUMBER(38,0),
+          WAREHOUSE_SIZE VARCHAR(16777216),
+          WAREHOUSE_TYPE VARCHAR(16777216),
+          CLUSTER_NUMBER NUMBER(38,0),
+          TOTAL_ELAPSED_TIME NUMBER(38,0),
+          TOTAL_QUEUE_TIME NUMBER(38,0),
+          TRANSACTION_BLOCKED_TIME NUMBER(38,0),
+          COMPILATION_TIME NUMBER(38,0),
+          DERIVED_ELAPSED_TIME_MS NUMBER(38,0),
+          ELAPSED_TIME_RATIO NUMBER(38,12),
+          ALLOCATED_CREDITS_USED NUMBER(38,12),
+          ALLOCATED_CREDITS_USED_COMPUTE NUMBER(38,12),
+          ALLOCATED_CREDITS_USED_CLOUD_SERVICES NUMBER(38,12)
+        );
+
+        CREATE TABLE IF NOT EXISTS ` + db_name + `.`+ schema_base_name_costing + `.CREDITS_ALLOCATION_VALIDATION_RESULTS (
+          CREATED_AT_TS TIMESTAMP_LTZ(9),
+          START_TIME TIMESTAMP_LTZ(9),
+          END_TIME TIMESTAMP_LTZ(9),
+          SOURCE_DATA_SOURCE VARCHAR(40),
+          TARGET_DATA_SOURCE VARCHAR(19),
+          SOURCE_CREDITS_USED NUMBER(38,4),
+          TARGET_CREDITS_USED NUMBER(38,4),
+          METERING_HOUR_MIN TIMESTAMP_LTZ(0),
+          METERING_HOUR_MAX TIMESTAMP_LTZ(0),
+          START_SLICE_MIN TIMESTAMP_LTZ(0),
+          START_SLICE_MAX TIMESTAMP_LTZ(0),
+          CREDITS_USED_DIFF NUMBER(38,4),
+          METERING_HOUR_MIN_DIFF_SECONDS NUMBER(18,0),
+          METERING_HOUR_MAX_DIFF_SECONDS NUMBER(18,0)
+    );
+
+        CREATE TABLE IF NOT EXISTS ` + db_name + `.`+ schema_base_name_costing + `.QUERY_COST_PARAMETERS(
+            PARAMETER_NAME VARCHAR(2000), 
+            PARAM_VALUE_TIMESTAMP TIMESTAMP_LTZ, 
+            PARAM_VALUE_STRING VARCHAR);
+        
+        create TABLE IF NOT EXISTS ` + db_name + `.`+ schema_base_name_costing + `.AUTOMATIC_CLUSTERING_WAREHOUSE_DTLS (
+          ACCOUNT_NAME VARCHAR(16777216),
+          START_TIME TIMESTAMP_LTZ(6),
+          END_TIME TIMESTAMP_LTZ(9),
+          CREDITS_USED NUMBER(38,9),
+          NUM_BYTES_RECLUSTERED NUMBER(38,0),
+          NUM_ROWS_RECLUSTERED NUMBER(38,0),
+          TABLE_ID NUMBER(38,0),
+          TABLE_NAME VARCHAR(16777216),
+          SCHEMA_ID NUMBER(38,0),
+          SCHEMA_NAME VARCHAR(16777216),
+          DATABASE_ID NUMBER(38,0),
+          DATABASE_NAME VARCHAR(16777216)
+        );
+
+        INSERT INTO  ` + db_name + `.LOGGING_SCHEMA.LOGGING_TABLE
+        VALUES ('CHILD_DB_SCHEMA_TABLE_STANDUP','SUCCESS', CURRENT_TIMESTAMP(), '`+account_name+`');
+        RETURN 'SUCCESS';
+        EXCEPTION
+          WHEN statement_error THEN
+            LET ERROR_MESSAGE := CURRENT_TIMESTAMP()||SQLCODE || ': '||SQLERRM;
+            INSERT INTO  ` + db_name + `.LOGGING_SCHEMA.LOGGING_TABLE
+            VALUES('CHILD_DB_SCHEMA_TABLE_STANDUP','FAILED', :ERROR_MESSAGE,'`+account_name+`' );
+            USE ROLE SYSADMIN;
+            USE WAREHOUSE COMPUTE_WH;
+            
+            RETURN OBJECT_CONSTRUCT('ERROR TYPE','STATEMENT_ERROR',
+                                            'SQLCODE', sqlcode,
+                                            'SQLERRM' , sqlerrm,
+                                            'SQLSTATE', sqlstate);
+        END;`
+      var statement5 = snowflake.createStatement({sqlText: kh_query});
+      var result2 = statement5.execute();
+
+      var role_creation_query = `
+        BEGIN
+        
+        -- OBSERVABILITY DB ROLE CREATIONS
+        USE ROLE SYSADMIN;
+        CREATE OR REPLACE ROLE ` + db_name + `_ADMIN;
+        CREATE OR REPLACE ROLE ` + db_name + `_DEV;
+        CREATE OR REPLACE ROLE ` + db_name + `_READER;
+        GRANT ROLE ` + db_name + `_ADMIN TO ROLE SYSADMIN;
+        GRANT ROLE ` + db_name + `_DEV TO ROLE ` + db_name + `_ADMIN;
+        GRANT ROLE ` + db_name + `_READER TO ROLE ` + db_name + `_ADMIN;
+        GRANT ROLE ` + db_name + `_ADMIN TO ROLE OBSERVABILITY_ADMIN;
+        GRANT ROLE ` + db_name + `_DEV TO ROLE OBSERVABILITY_ADMIN;
+        GRANT ROLE ` + db_name + `_READER TO ROLE OBSERVABILITY_ADMIN;
+        
+        -- DEV PRIVILEGES
+        GRANT USAGE,MONITOR,CREATE SCHEMA ON DATABASE ` + db_name + ` TO ROLE ` + db_name + `_DEV;
+        GRANT ALL ON SCHEMA ` + db_name + `.PUBLIC TO ROLE ` + db_name + `_DEV;
+        GRANT ALL ON ALL TABLES IN SCHEMA ` + db_name + `.PUBLIC TO ROLE ` + db_name + `_DEV;
+        GRANT ALL ON FUTURE TABLES IN SCHEMA ` + db_name + `.PUBLIC TO ROLE ` + db_name + `_DEV;
+        GRANT ALL ON ALL VIEWS IN SCHEMA ` + db_name + `.PUBLIC TO ROLE ` + db_name + `_DEV;
+        GRANT ALL ON FUTURE VIEWS IN SCHEMA ` + db_name + `.PUBLIC TO ROLE ` + db_name + `_DEV;
+        GRANT USAGE,MONITOR,CREATE SCHEMA ON DATABASE ` + db_name + ` TO ROLE ` + db_name + `_DEV;
+        GRANT ALL ON SCHEMA ` + db_name + `.OBSERVABILITY_CORE TO ROLE ` + db_name + `_DEV;
+        GRANT ALL ON ALL TABLES IN SCHEMA ` + db_name + `.OBSERVABILITY_CORE TO ROLE ` + db_name + `_DEV;
+        GRANT ALL ON FUTURE TABLES IN SCHEMA ` + db_name + `.OBSERVABILITY_CORE TO ROLE ` + db_name + `_DEV;
+        GRANT ALL ON ALL VIEWS IN SCHEMA ` + db_name + `.OBSERVABILITY_CORE TO ROLE ` + db_name + `_DEV;
+        GRANT ALL ON FUTURE VIEWS IN SCHEMA ` + db_name + `.OBSERVABILITY_CORE TO ROLE ` + db_name + `_DEV;
+        
+        -- READER PRIVILEGES
+        GRANT USAGE,MONITOR ON DATABASE ` + db_name + ` TO ROLE ` + db_name + `_READER;
+        GRANT USAGE ON SCHEMA ` + db_name + `.PUBLIC TO ROLE ` + db_name + `_READER;
+        GRANT SELECT ON ALL TABLES IN SCHEMA ` + db_name + `.PUBLIC TO ROLE ` + db_name + `_READER;
+        GRANT SELECT ON FUTURE TABLES IN SCHEMA ` + db_name + `.PUBLIC TO ROLE ` + db_name + `_READER;
+        GRANT SELECT ON ALL VIEWS IN SCHEMA ` + db_name + `.PUBLIC TO ROLE ` + db_name + `_READER;
+        GRANT SELECT ON FUTURE VIEWS IN SCHEMA ` + db_name + `.PUBLIC TO ROLE ` + db_name + `_READER;
+        GRANT USAGE,MONITOR ON DATABASE ` + db_name + ` TO ROLE ` + db_name + `_READER;
+        GRANT USAGE ON SCHEMA ` + db_name + `.OBSERVABILITY_CORE TO ROLE ` + db_name + `_READER;
+        GRANT SELECT ON ALL TABLES IN SCHEMA ` + db_name + `.OBSERVABILITY_CORE TO ROLE ` + db_name + `_READER;
+        GRANT SELECT ON FUTURE TABLES IN SCHEMA ` + db_name + `.OBSERVABILITY_CORE TO ROLE ` + db_name + `_READER;
+        GRANT SELECT ON ALL VIEWS IN SCHEMA ` + db_name + `.OBSERVABILITY_CORE TO ROLE ` + db_name + `_READER;
+        GRANT SELECT ON FUTURE VIEWS IN SCHEMA ` + db_name + `.OBSERVABILITY_CORE TO ROLE ` + db_name + `_READER;
+        
+       
+        
+        USE ROLE OBSERVABILITY_ADMIN;
+        INSERT INTO  ` + db_name + `.LOGGING_SCHEMA.LOGGING_TABLE
+            VALUES ('CHILD_DB_SCHEMA_TABLE_STANDUP','SUCCESS', CURRENT_TIMESTAMP(), '`+account_name+`');
+            RETURN 'SUCCESS';
+            EXCEPTION
+                WHEN STATEMENT_ERROR THEN
+                LET ERROR_MESSAGE := CURRENT_TIMESTAMP()||SQLCODE || ': '||SQLERRM;
+                INSERT INTO  ` + db_name + `.LOGGING_SCHEMA.LOGGING_TABLE
+                    VALUES('CHILD_DB_SCHEMA_TABLE_STANDUP','FAILED', :ERROR_MESSAGE,'`+account_name+`' );
+                    USE ROLE SYSADMIN;
+                    USE WAREHOUSE COMPUTE_WH;
+                      
+                    return object_construct('Error type','STATEMENT_ERROR',
+                                            'SQLCODE', sqlcode,
+                                            'SQLERRM' , sqlerrm,
+                                            'SQLSTATE', sqlstate);
+        END;`
+      var statement6 = snowflake.createStatement({sqlText: role_creation_query});
+
+      //statement_joined= statement4.getSqlText() + statement5.getSqlText() + statement6.getSqlText() //only for development
+      //return statement_joined //only for development
+      
+      var result6 = statement6.execute();
+      return 'SUCCESS'
+      $$;
+
+CALL IDENTIFIER($ProcCHILD_DB_SCHEMA_TABLE_STANDUP)();
+/*OR*/
+CALL JSA18243_OBSERVABILITY_METRICS.SETUP_PROCEDURES_V1.CHILD_DB_SCHEMA_TABLE_STANDUP(); --CUSTOMIZE
+      
+ --serial:4 (code block D.a) : Metrics Creation and Task  
+/*Approx Runtime on Call: 09+ min */
+
+
+USE ROLE SYSADMIN;
+USE WAREHOUSE COMPUTE_WH;
+
+--while creating Proc you may face error that cannot create object. To resolve this set DB/Schema in worksheet selector first.
+SET ProcOBSERVABILITY_METRICS_CREATE_PROCEDURE = (SELECT $schemaSetupProcedure||'.OBSERVABILITY_METRICS_CREATE_PROCEDURE');
+
+create or replace procedure IDENTIFIER($ProcOBSERVABILITY_METRICS_CREATE_PROCEDURE)()
+      returns string
+      language javascript
+      execute as caller
+    AS
+    $$
+
+    var db_base_name = "_OBSERVABILITY_METRICS"; 
+    var schema_name = "OBSERVABILITY_CORE";
+           
+
+    var account_query = "SELECT CURRENT_ACCOUNT()";
+    var statement0 = snowflake.createStatement({sqlText: account_query});
+    var account = statement0.execute();
+    account.next();
+    account_name = account.getColumnValue(1);
+      
+    var query_db = `SELECT '`+ account_name + db_base_name + `'`;
+    var statement1 = snowflake.createStatement({sqlText: query_db});
+    var db = statement1.execute();
+    db.next();
+    db_name = db.getColumnValue(1);
+
+          
+    var query = `
+      BEGIN
+      INSERT INTO ` + db_name + `.` + schema_name + `.OBSERVABILITY_METRICS(
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+      ),
+      QUERY AS (
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'LONG_RUNNING_QUERY' AS METRICNAME,
+          QH.WAREHOUSE_NAME AS DESCRIPTION,
+          START_TIME AS TIMESTAMP,
+          QUERY_ID QUERYID,
+          ROUND(INBOUND_DATA_TRANSFER_BYTES/1024/1024/1024/1024) AS DATATRANSFER,
+          EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2 AS COMPUTECOST,
+          CASE WHEN (QH.WAREHOUSE_SIZE = 'X-Small' 
+            OR QH.WAREHOUSE_SIZE = 'Small' 
+            OR QH.WAREHOUSE_SIZE = 'Medium'
+            OR QH.WAREHOUSE_SIZE = 'Large'
+            OR QH.WAREHOUSE_SIZE = 'X-Large') AND EXECUTION_TIME > 21600000 THEN 1
+            WHEN (QH.WAREHOUSE_SIZE = '2X-Large'
+              OR QH.WAREHOUSE_SIZE = '3X-Large') AND EXECUTION_TIME > 14400000 THEN 1
+            WHEN QH.WAREHOUSE_SIZE = '4X-Large' AND EXECUTION_TIME > 7200000 THEN 1
+              ELSE 0 END AS LONGRUNNING_FLAG
+        FROM TABLE(SNOWFLAKE.INFORMATION_SCHEMA.QUERY_HISTORY()) QH 
+        INNER JOIN WAREHOUSE_SIZES WH
+          ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        WHERE EXECUTION_STATUS='RUNNING'
+            )
+        SELECT ACCOUNT,
+          METRICNAME,
+          DESCRIPTION,
+          TIMESTAMP,
+          QUERYID,
+          DATATRANSFER,
+          NULL TOTALCOST,
+          COMPUTECOST,
+          NULL STORAGECOST,
+          LONGRUNNING_FLAG LONGRUNNINGQUERY,
+          NULL TOPWAREHOUSE ,
+          NULL TOPUSER ,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        WHERE LONGRUNNING_FLAG = 1 
+          AND NOT EXISTS (
+            SELECT QUERYID
+            FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+            WHERE QH.QUERYID = OB.QUERYID
+              AND QH.METRICNAME = OB.METRICNAME)
+            );
+            
+      
+      --Data transfer
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+      )
+      ,QUERY AS (
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'DATATRANSFER' AS METRICNAME,
+          NULL AS DESCRIPTION,
+          START_TIME AS TIMESTAMP,
+          QUERY_ID QUERYID,
+          INBOUND_DATA_TRANSFER_BYTES/1024/1024/1024/1024 AS DATATRANSFER,
+          NULL TOTALCOST,
+          EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR AS COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE ,
+          NULL TOPUSER ,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM TABLE(SNOWFLAKE.INFORMATION_SCHEMA.QUERY_HISTORY()) QH
+        INNER JOIN WAREHOUSE_SIZES WH
+          ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE)
+        SELECT *
+        FROM QUERY QH 
+        WHERE DATATRANSFER >= 5 AND NOT EXISTS (
+            SELECT QUERYID
+            FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+            WHERE QH.ACCOUNT = OB.ACCOUNT
+                AND QH.QUERYID = OB.QUERYID)
+        ORDER BY DATATRANSFER DESC);
+      
+      --compute cost
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+      ),
+      COMPUTE AS (
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'COMPUTECOST' AS METRICNAME,
+          START_TIME TIMESTAMP,
+          ROLE_NAME || ' ' || USER_NAME AS DESCRIPTION,
+          QUERY_ID QUERYID,
+        ROUND(INBOUND_DATA_TRANSFER_BYTES/1024/1024/1024/1024) AS DATATRANSFER,
+        EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2 AS COMPUTECOST
+        FROM TABLE(SNOWFLAKE.INFORMATION_SCHEMA.QUERY_HISTORY()) QH
+        INNER JOIN WAREHOUSE_SIZES WH
+          ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        )
+      SELECT ACCOUNT,
+          METRICNAME,
+          DESCRIPTION,
+          TIMESTAMP,
+          QUERYID,
+          DATATRANSFER,
+          NULL TOTALCOST,
+          COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE ,
+          NULL TOPUSER ,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+      FROM COMPUTE QH
+      WHERE COMPUTECOST > 11.5 AND NOT EXISTS (
+          SELECT QUERYID
+          FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+          WHERE QH.ACCOUNT = OB.ACCOUNT 
+            AND QH.TIMESTAMP = OB.TIMESTAMP
+            AND QH.QUERYID = OB.QUERYID) );
+
+      --top warehouse
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+        ), QUERY AS(
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'TOPWAREHOUSE_MONTH' AS METRICNAME, 
+         date_trunc('MONTH',MIN(DATE(START_TIME))) TIMESTAMP,
+          NULL AS QUERYID,
+          warehouse_name, 
+          sum(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST,
+       --    ROW_NUMBER() OVER (ORDER BY EXECUTION_TIME  DESC) AS row_num
+         SUM(INBOUND_DATA_TRANSFER_BYTES) AS DATATRANSFER,
+         -- SUM(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST
+        FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+        INNER JOIN WAREHOUSE_SIZES WH
+            ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        WHERE USER_NAME != 'SYSTEM' 
+          AND DATEDIFF(MONTH, START_TIME,CURRENT_DATE()) = 1
+         GROUP BY all
+       ORDER BY 6 DESC
+        LIMIT 10)
+      , DESCRIPTION AS (
+        SELECT 
+       ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          ' TOP 10 warehouse list'  AS DESCRIPTION,
+          NULL AS QUERYID,
+          '0' DATATRANSFER,
+          NULL TOTALCOST,
+          '0' COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          ARRAY_AGG(CONCAT(warehouse_name, ': ', COMPUTECOST)) within group (ORDER BY COMPUTECOST DESC) TOPWAREHOUSE,
+          NULL TOPUSER ,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        group by all)
+      SELECT * 
+      FROM DESCRIPTION QH
+      WHERE NOT EXISTS (
+        SELECT QUERYID
+        FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+        WHERE QH.ACCOUNT = OB.ACCOUNT 
+          AND QH.DESCRIPTION = OB.DESCRIPTION
+            AND DATE(QH.TIMESTAMP) = DATE(OB.TIMESTAMP)
+            )
+          );
+      
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      --weekly
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+        ), QUERY AS(
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'TOPWAREHOUSE_WEEK' AS METRICNAME, 
+         date_trunc('WEEK',MIN(DATE(START_TIME))) TIMESTAMP,
+          NULL AS QUERYID,
+          warehouse_name, 
+          sum(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST,
+       --    ROW_NUMBER() OVER (ORDER BY EXECUTION_TIME  DESC) AS row_num
+         SUM(INBOUND_DATA_TRANSFER_BYTES) AS DATATRANSFER,
+         -- SUM(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST
+        FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+        INNER JOIN WAREHOUSE_SIZES WH
+            ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        WHERE USER_NAME != 'SYSTEM' 
+          AND DATEDIFF(WEEK, START_TIME,CURRENT_DATE()) = 1
+         GROUP BY all
+       ORDER BY 6 DESC
+        LIMIT 10)
+      , DESCRIPTION AS (
+        SELECT 
+       ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          ' TOP 10 warehouse list'  AS DESCRIPTION,
+          NULL AS QUERYID,
+          '0' DATATRANSFER,
+          NULL TOTALCOST,
+          '0' COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          ARRAY_AGG(CONCAT(warehouse_name, ': ', COMPUTECOST)) within group (ORDER BY COMPUTECOST DESC) TOPWAREHOUSE,
+          NULL TOPUSER ,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        group by all)
+      SELECT * 
+      FROM DESCRIPTION QH
+      WHERE DESCRIPTION IS NOT NULL 
+        AND NOT EXISTS (
+          SELECT QUERYID
+          FROM `+db_name+`.` + schema_name + `.OBSERVABILITY_METRICS OB
+          WHERE QH.ACCOUNT = OB.ACCOUNT 
+            AND QH.DESCRIPTION = OB.DESCRIPTION
+            AND DATE(QH.TIMESTAMP) = DATE(OB.TIMESTAMP))
+        ); 
+
+      --day
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+        ), QUERY AS(
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'TOPWAREHOUSE_DAY' AS METRICNAME, 
+         date_trunc('DAY',MIN(DATE(START_TIME))) TIMESTAMP,
+          NULL AS QUERYID,
+          warehouse_name, 
+          sum(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST,
+       --    ROW_NUMBER() OVER (ORDER BY EXECUTION_TIME  DESC) AS row_num
+         SUM(INBOUND_DATA_TRANSFER_BYTES) AS DATATRANSFER,
+         -- SUM(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST
+        FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+        INNER JOIN WAREHOUSE_SIZES WH
+            ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        WHERE USER_NAME != 'SYSTEM' 
+          AND DATEDIFF(DAY, START_TIME,CURRENT_DATE()) = 1
+         GROUP BY all
+       ORDER BY 6 DESC
+        LIMIT 10)
+      , DESCRIPTION AS (
+        SELECT 
+       ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          ' TOP 10 warehouse list'  AS DESCRIPTION,
+          NULL AS QUERYID,
+          '0' DATATRANSFER,
+          NULL TOTALCOST,
+          '0' COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          ARRAY_AGG(CONCAT(warehouse_name, ': ', COMPUTECOST)) within group (ORDER BY COMPUTECOST DESC) TOPWAREHOUSE,
+          NULL TOPUSER ,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        group by all)
+      SELECT * 
+      FROM DESCRIPTION QH
+      WHERE DESCRIPTION IS NOT NULL 
+        AND NOT EXISTS (
+          SELECT QUERYID
+          FROM `+db_name+`.` + schema_name + `.OBSERVABILITY_METRICS OB
+          WHERE QH.ACCOUNT = OB.ACCOUNT 
+            AND QH.DESCRIPTION = OB.DESCRIPTION
+            AND DATE(QH.TIMESTAMP) = DATE(OB.TIMESTAMP)
+            )
+        );
+      
+      --TOP USERS
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+        ), QUERY AS(
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'TOPUSER_MONTH' AS METRICNAME, 
+         date_trunc('MONTH',MIN(DATE(START_TIME))) TIMESTAMP,
+          NULL AS QUERYID,
+          USER_NAME, 
+          sum(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST,
+       --    ROW_NUMBER() OVER (ORDER BY EXECUTION_TIME  DESC) AS row_num
+         SUM(INBOUND_DATA_TRANSFER_BYTES) AS DATATRANSFER,
+         -- SUM(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST
+        FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+        INNER JOIN WAREHOUSE_SIZES WH
+            ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        WHERE USER_NAME != 'SYSTEM' 
+          AND DATEDIFF(MONTH, START_TIME,CURRENT_DATE()) = 1
+         GROUP BY all
+       ORDER BY 6 DESC
+        LIMIT 10)
+      , DESCRIPTION AS (
+        SELECT 
+       ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          ' TOP 10 users list'  AS DESCRIPTION,
+          NULL AS QUERYID,
+          '0' DATATRANSFER,
+          NULL TOTALCOST,
+          '0' COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE ,
+          ARRAY_AGG(CONCAT(user_name, ': ', COMPUTECOST)) within group (ORDER BY COMPUTECOST DESC) TOPUSER,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        group by all)
+      SELECT *
+      FROM DESCRIPTION QH
+      WHERE DESCRIPTION IS NOT NULL 
+        AND NOT EXISTS (
+          SELECT QUERYID
+          FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+          WHERE QH.ACCOUNT = OB.ACCOUNT 
+            AND QH.DESCRIPTION = OB.DESCRIPTION
+            AND DATE(QH.TIMESTAMP) = DATE(OB.TIMESTAMP)
+            ));
+
+        --WEEK
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+        ), QUERY AS(
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'TOPUSER_WEEK' AS METRICNAME, 
+         date_trunc('WEEK',MIN(DATE(START_TIME))) TIMESTAMP,
+          NULL AS QUERYID,
+          USER_NAME, 
+          sum(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST,
+       --    ROW_NUMBER() OVER (ORDER BY EXECUTION_TIME  DESC) AS row_num
+         SUM(INBOUND_DATA_TRANSFER_BYTES) AS DATATRANSFER,
+         -- SUM(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST
+        FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+        INNER JOIN WAREHOUSE_SIZES WH
+            ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        WHERE USER_NAME != 'SYSTEM' 
+          AND DATEDIFF(WEEK, START_TIME,CURRENT_DATE()) = 1
+         GROUP BY all
+       ORDER BY 6 DESC
+        LIMIT 10)
+      , DESCRIPTION AS (
+        SELECT 
+       ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          ' TOP 10 users list'  AS DESCRIPTION,
+          NULL AS QUERYID,
+          '0' DATATRANSFER,
+          NULL TOTALCOST,
+          '0' COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE ,
+          ARRAY_AGG(CONCAT(user_name, ': ', COMPUTECOST)) within group (ORDER BY COMPUTECOST DESC) TOPUSER,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        group by all)
+      SELECT *
+      FROM DESCRIPTION QH
+      WHERE DESCRIPTION IS NOT NULL AND NOT EXISTS (
+          SELECT QUERYID
+          FROM `+db_name+`.` + schema_name + `.OBSERVABILITY_METRICS OB
+          WHERE QH.ACCOUNT = OB.ACCOUNT 
+            AND QH.DESCRIPTION = OB.DESCRIPTION
+            AND DATE(QH.TIMESTAMP) = DATE(OB.TIMESTAMP)
+            )
+          );
+      
+      --day
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+        ), QUERY AS(
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'TOPUSER_DAY' AS METRICNAME, 
+         date_trunc('DAY',MIN(DATE(START_TIME))) TIMESTAMP,
+          NULL AS QUERYID,
+          USER_NAME, 
+          sum(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST,
+       --    ROW_NUMBER() OVER (ORDER BY EXECUTION_TIME  DESC) AS row_num
+         SUM(INBOUND_DATA_TRANSFER_BYTES) AS DATATRANSFER,
+         -- SUM(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST
+        FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+        INNER JOIN WAREHOUSE_SIZES WH
+            ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        WHERE USER_NAME != 'SYSTEM' 
+          AND DATEDIFF(DAY, START_TIME,CURRENT_DATE()) = 1
+         GROUP BY all
+       ORDER BY 6 DESC
+        LIMIT 10)
+      , DESCRIPTION AS (
+        SELECT 
+       ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          ' TOP 10 users list'  AS DESCRIPTION,
+          NULL AS QUERYID,
+          '0' DATATRANSFER,
+          NULL TOTALCOST,
+          '0' COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE ,
+          ARRAY_AGG(CONCAT(user_name, ': ', COMPUTECOST)) within group (ORDER BY COMPUTECOST DESC) TOPUSER,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        group by all)
+      SELECT *
+      FROM DESCRIPTION QH
+      WHERE DESCRIPTION IS NOT NULL 
+        AND NOT EXISTS (
+          SELECT QUERYID
+          FROM `+db_name+ `.` + schema_name + `.OBSERVABILITY_METRICS OB
+          WHERE QH.ACCOUNT = OB.ACCOUNT 
+            AND QH.DESCRIPTION = OB.DESCRIPTION
+            AND DATE(QH.TIMESTAMP) = DATE(OB.TIMESTAMP)
+            )
+          );
+
+      --TOP ROLES
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+        ), QUERY AS(
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'TOPROLE_MONTH' AS METRICNAME, 
+         date_trunc('MONTH',MIN(DATE(START_TIME))) TIMESTAMP,
+          NULL AS QUERYID,
+          ROLE_NAME, 
+          sum(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST,
+       --    ROW_NUMBER() OVER (ORDER BY EXECUTION_TIME  DESC) AS row_num
+         SUM(INBOUND_DATA_TRANSFER_BYTES) AS DATATRANSFER,
+         -- SUM(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST
+        FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+        INNER JOIN WAREHOUSE_SIZES WH
+            ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        WHERE USER_NAME != 'SYSTEM' 
+          AND DATEDIFF(MONTH, START_TIME,CURRENT_DATE()) = 1
+         GROUP BY all
+       ORDER BY 6 DESC
+        LIMIT 10)
+      , DESCRIPTION AS (
+        SELECT 
+       ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          ' TOP 10 role list'  AS DESCRIPTION,
+          NULL AS QUERYID,
+          '0' DATATRANSFER,
+          NULL TOTALCOST,
+          '0' COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE,
+          NULL TOPUSER ,
+          ARRAY_AGG(CONCAT(ROLE_NAME, ': ', COMPUTECOST)) within group (ORDER BY COMPUTECOST DESC) TOPROLE,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        group by all)
+      SELECT *
+      FROM DESCRIPTION QH
+      WHERE DESCRIPTION IS NOT NULL 
+        AND NOT EXISTS (
+          SELECT QUERYID
+          FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+          WHERE QH.ACCOUNT = OB.ACCOUNT 
+            AND QH.DESCRIPTION = OB.DESCRIPTION
+            AND DATE(QH.TIMESTAMP) = DATE(OB.TIMESTAMP)
+            )
+          );
+
+      --week
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+        ), QUERY AS(
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'TOPROLE_WEEK' AS METRICNAME, 
+         date_trunc('WEEK',MIN(DATE(START_TIME))) TIMESTAMP,
+          NULL AS QUERYID,
+          ROLE_NAME, 
+          sum(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST,
+       --    ROW_NUMBER() OVER (ORDER BY EXECUTION_TIME  DESC) AS row_num
+         SUM(INBOUND_DATA_TRANSFER_BYTES) AS DATATRANSFER,
+         -- SUM(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST
+        FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+        INNER JOIN WAREHOUSE_SIZES WH
+            ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        WHERE USER_NAME != 'SYSTEM' 
+          AND DATEDIFF(WEEK, START_TIME,CURRENT_DATE()) = 1
+         GROUP BY all
+       ORDER BY 6 DESC
+        LIMIT 10)
+      , DESCRIPTION AS (
+        SELECT 
+       ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          ' TOP 10 role list'  AS DESCRIPTION,
+          NULL AS QUERYID,
+          '0' DATATRANSFER,
+          NULL TOTALCOST,
+          '0' COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE,
+          NULL TOPUSER ,
+          ARRAY_AGG(CONCAT(ROLE_NAME, ': ', COMPUTECOST)) within group (ORDER BY COMPUTECOST DESC) TOPROLE,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        group by all)
+      SELECT *
+      FROM DESCRIPTION QH
+      WHERE DESCRIPTION IS NOT NULL
+        AND NOT EXISTS (
+          SELECT QUERYID
+          FROM `+db_name+`.` + schema_name + `.OBSERVABILITY_METRICS OB
+          WHERE QH.ACCOUNT = OB.ACCOUNT 
+            AND QH.DESCRIPTION = OB.DESCRIPTION
+            AND DATE(QH.TIMESTAMP) = DATE(OB.TIMESTAMP)
+            )
+          );
+
+      --day
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+        ), QUERY AS(
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'TOPROLE_DAY' AS METRICNAME, 
+         date_trunc('DAY',MIN(DATE(START_TIME))) TIMESTAMP,
+          NULL AS QUERYID,
+          ROLE_NAME, 
+          sum(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST,
+       --    ROW_NUMBER() OVER (ORDER BY EXECUTION_TIME  DESC) AS row_num
+         SUM(INBOUND_DATA_TRANSFER_BYTES) AS DATATRANSFER,
+         -- SUM(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) AS COMPUTECOST
+        FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+        INNER JOIN WAREHOUSE_SIZES WH
+            ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+        WHERE USER_NAME != 'SYSTEM' 
+          AND DATEDIFF(DAY, START_TIME,CURRENT_DATE()) = 1
+         GROUP BY all
+       ORDER BY 6 DESC
+        LIMIT 10)
+      , DESCRIPTION AS (
+        SELECT 
+       ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          ' TOP 10 role list'  AS DESCRIPTION,
+          NULL AS QUERYID,
+          '0' DATATRANSFER,
+          NULL TOTALCOST,
+          '0' COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE,
+          NULL TOPUSER ,
+          ARRAY_AGG(CONCAT(ROLE_NAME, ': ', COMPUTECOST)) within group (ORDER BY COMPUTECOST DESC) TOPROLE,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        group by all)
+      SELECT *
+      FROM DESCRIPTION QH
+      WHERE DESCRIPTION IS NOT NULL 
+        AND NOT EXISTS (
+          SELECT QUERYID
+          FROM `+db_name+ `.` + schema_name + `.OBSERVABILITY_METRICS OB
+          WHERE QH.ACCOUNT = OB.ACCOUNT 
+            AND QH.DESCRIPTION = OB.DESCRIPTION
+            AND DATE(QH.TIMESTAMP) = DATE(OB.TIMESTAMP)
+            )
+        );
+
+      --timeout
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+      )
+      ,QUERY AS (
+      SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+          'TIMEOUTQUERY' AS METRICNAME,
+          START_TIME TIMESTAMP,
+          NULL AS DESCRIPTION,
+          QUERY_ID QUERYID,
+        ROUND(INBOUND_DATA_TRANSFER_BYTES/1024/1024/1024/1024) AS DATATRANSFER,
+        EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2 AS COMPUTECOST
+      FROM TABLE(SNOWFLAKE.INFORMATION_SCHEMA.QUERY_HISTORY()) QH
+      INNER JOIN WAREHOUSE_SIZES WH
+          ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+      WHERE EXECUTION_STATUS = 'FAILED_WITH_ERROR' AND ERROR_CODE = 630
+      )
+      SELECT ACCOUNT,
+        METRICNAME, 
+        TIMESTAMP,
+        DESCRIPTION,
+        QUERYID,
+        DATATRANSFER,
+        NULL TOTALCOST,
+        COMPUTECOST,
+        NULL STORAGECOST,
+        NULL LONGRUNNINGQUERY ,
+        NULL TOPWAREHOUSE ,
+        NULL TOPUSER ,
+        NULL TOPROLE ,
+        QUERYID QUERYTIMEOUT ,
+        NULL TASKCREDITS ,
+        NULL WAREHOUSEPROVISION ,
+        NULL QUERYQUEUEING ,
+        NULL WAREHOUSEREPAIR ,
+        NULL SERVICEACCOUNT ,
+        NULL ADMINLOGIN ,
+        NULL UNUSEDROLE ,
+        NULL NOTALLOWEDUSER 
+      FROM QUERY QH
+      WHERE DATEDIFF(DAY, TIMESTAMP,CURRENT_DATE()) = 1 AND NOT EXISTS (
+          SELECT QUERYID
+          FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+          WHERE QH.ACCOUNT = OB.ACCOUNT 
+            AND QH.QUERYID = OB.QUERYID)
+          );
+          
+      --TASK CREDITS
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH WAREHOUSE_SIZES AS (
+        SELECT 'X-Small' AS WAREHOUSE_SIZE, 1 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Small' AS WAREHOUSE_SIZE, 2 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Medium'  AS WAREHOUSE_SIZE, 4 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'Large' AS WAREHOUSE_SIZE, 8 AS CREDITS_PER_HOUR UNION ALL
+        SELECT 'X-Large' AS WAREHOUSE_SIZE, 16 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '2X-Large' AS WAREHOUSE_SIZE, 32 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '3X-Large' AS WAREHOUSE_SIZE, 64 AS CREDITS_PER_HOUR UNION ALL
+        SELECT '4X-Large' AS WAREHOUSE_SIZE, 128 AS CREDITS_PER_HOUR
+      ) 
+      ,QUERY AS (
+      SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+        'TASKS' AS METRICNAME,
+        DATE(START_TIME) TIMESTAMP ,
+        ROLE_NAME ||' '|| WAREHOUSE_NAME AS DESCRIPTION,
+        NULL AS QUERYID, 
+        SUM(INBOUND_DATA_TRANSFER_BYTES) DATATRANSFER,
+        SUM(EXECUTION_TIME/(1000*60*60)*WH.CREDITS_PER_HOUR*2) COMPUTECOST
+      FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+      INNER JOIN WAREHOUSE_SIZES WH
+          ON QH.WAREHOUSE_SIZE=WH.WAREHOUSE_SIZE
+      WHERE USER_NAME = 'SYSTEM'
+      GROUP BY 1,2,3,4)
+      SELECT ACCOUNT,
+        METRICNAME, 
+        TIMESTAMP,
+        DESCRIPTION,
+        QUERYID,
+        DATATRANSFER,
+        NULL TOTALCOST,
+        COMPUTECOST,
+        NULL STORAGECOST,
+        NULL LONGRUNNINGQUERY ,
+        NULL TOPWAREHOUSE ,
+        NULL TOPUSER ,
+        NULL TOPROLE ,
+        NULL QUERYTIMEOUT ,
+        COMPUTECOST TASKCREDITS ,
+        NULL WAREHOUSEPROVISION ,
+        NULL QUERYQUEUEING ,
+        NULL WAREHOUSEREPAIR ,
+        NULL SERVICEACCOUNT ,
+        NULL ADMINLOGIN ,
+        NULL UNUSEDROLE ,
+        NULL NOTALLOWEDUSER 
+      FROM QUERY QH
+      WHERE DESCRIPTION IS NOT NULL 
+          AND COMPUTECOST >= 285
+          AND DATEDIFF(DAY, TIMESTAMP,CURRENT_DATE()) = 1
+          AND NOT EXISTS (
+            SELECT QUERYID
+            FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+            WHERE QH.ACCOUNT = OB.ACCOUNT 
+              AND QH.METRICNAME = OB.METRICNAME
+              AND QH.TIMESTAMP = OB.TIMESTAMP)
+              );
+    
+      --Warehouse provisiong query
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH QUERY AS (
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+            'WAREHOUSE_LONG_PROVISIONING' AS METRICNAME,
+            'WAREHOUSE NAME: ' || WAREHOUSE_NAME || ' QUEUED PROVISIONING TIME: ' || QUEUED_PROVISIONING_TIME/60000 AS DESCRIPTION,            
+            WAREHOUSE_NAME,
+            START_TIME AS TIMESTAMP,
+            QUERY_ID AS QUERYID,
+            NULL AS DATATRANSFER,
+            NULL AS COMPUTECOST
+        FROM TABLE(SNOWFLAKE.INFORMATION_SCHEMA.QUERY_HISTORY(END_TIME_RANGE_START=>DATEADD(MINUTES, -5, CURRENT_TIMESTAMP()))) 
+        WHERE QUEUED_PROVISIONING_TIME/60000 >=3)
+        SELECT ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          DESCRIPTION,
+          QUERYID,
+          DATATRANSFER,
+          NULL TOTALCOST,
+          COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE ,
+          NULL TOPUSER ,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          WAREHOUSE_NAME WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        WHERE NOT EXISTS (
+      SELECT QUERYID 
+      FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+      WHERE QH.ACCOUNT = OB.ACCOUNT 
+        AND QH.METRICNAME = OB.METRICNAME
+        AND QH.TIMESTAMP = OB.TIMESTAMP)
+      );
+
+      --Query Queueing time
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+      WITH QUERY AS (
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+            'QUERY_QUEUEING_TIME' AS METRICNAME,
+            'WAREHOUSE NAME: ' || WAREHOUSE_NAME ||'WAREHOUSE SIZE: '|| WAREHOUSE_SIZE || ' QUEUED OVERLOAD TIME: ' || QUEUED_OVERLOAD_TIME/60000 AS DESCRIPTION,
+            START_TIME AS TIMESTAMP,
+            QUERY_ID AS QUERYID,
+            NULL AS DATATRANSFER,
+            NULL AS COMPUTECOST
+        FROM TABLE(SNOWFLAKE.INFORMATION_SCHEMA.QUERY_HISTORY(END_TIME_RANGE_START=>DATEADD(MINUTES, -5, CURRENT_TIMESTAMP()))) 
+        WHERE QUEUED_OVERLOAD_TIME/60000 >=3)
+        SELECT ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          DESCRIPTION,
+          QUERYID,
+          DATATRANSFER,
+          NULL TOTALCOST,
+          COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE ,
+          NULL TOPUSER ,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          QUERYID QUERYQUEUEING ,
+          NULL WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        WHERE NOT EXISTS (
+      SELECT QUERYID
+      FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+      WHERE QH.ACCOUNT = OB.ACCOUNT 
+        AND QH.METRICNAME = OB.METRICNAME
+        AND QH.TIMESTAMP = OB.TIMESTAMP)
+      );
+
+      --warehouse repair time
+      INSERT INTO `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS (
+        WITH QUERY AS (
+        SELECT CURRENT_ACCOUNT() AS ACCOUNT,
+            'QUERY_QUEUEING_TIME' AS METRICNAME,
+            'WAREHOUSE NAME: ' || WAREHOUSE_NAME ||'WAREHOUSE SIZE: '|| WAREHOUSE_SIZE || ' QUEUED REPAIR TIME: ' || QUEUED_REPAIR_TIME/60000 AS DESCRIPTION,
+            WAREHOUSE_NAME,
+            START_TIME AS TIMESTAMP,
+            QUERY_ID AS QUERYID,
+            NULL AS DATATRANSFER,
+            NULL AS COMPUTECOST
+        FROM TABLE(SNOWFLAKE.INFORMATION_SCHEMA.QUERY_HISTORY(END_TIME_RANGE_START=>DATEADD(MINUTES, -5, CURRENT_TIMESTAMP()))) 
+        WHERE QUEUED_REPAIR_TIME/60000 >=3)
+        SELECT ACCOUNT,
+          METRICNAME, 
+          TIMESTAMP,
+          DESCRIPTION,
+          QUERYID,
+          DATATRANSFER,
+          NULL TOTALCOST,
+          COMPUTECOST,
+          NULL STORAGECOST,
+          NULL LONGRUNNINGQUERY ,
+          NULL TOPWAREHOUSE ,
+          NULL TOPUSER ,
+          NULL TOPROLE ,
+          NULL QUERYTIMEOUT ,
+          NULL TASKCREDITS ,
+          NULL WAREHOUSEPROVISION ,
+          NULL QUERYQUEUEING ,
+          WAREHOUSE_NAME WAREHOUSEREPAIR ,
+          NULL SERVICEACCOUNT ,
+          NULL ADMINLOGIN ,
+          NULL UNUSEDROLE ,
+          NULL NOTALLOWEDUSER 
+        FROM QUERY QH
+        WHERE NOT EXISTS (
+        SELECT QUERYID
+        FROM `+ db_name + `.` + schema_name + `.OBSERVABILITY_METRICS OB
+        WHERE QH.ACCOUNT = OB.ACCOUNT 
+          AND QH.METRICNAME = OB.METRICNAME
+          AND QH.TIMESTAMP = OB.TIMESTAMP)
+      );
+      RETURN 'SUCCESS';
+      END;`
+
+    var statement2 = snowflake.createStatement({sqlText: query});
+    var result = statement2.execute()
+    result.next()
+    return result.getColumnValue(1)
+    $$;
+
+    
+CALL IDENTIFIER($ProcOBSERVABILITY_METRICS_CREATE_PROCEDURE)();
+
+
+-- serial:5 (code block D.b) Task - Metrics Creation.sql
+
+--call OBSERVABILITY_SETUP.SETUP_PROCEDURES_V1.OBSERVABILITY_METRICS_TSK_CREATEPROC();
+
+SET procOBSERVABILITY_METRICS_TSK_CREATEPROC = (SELECT $schemaSetupProcedure||'.OBSERVABILITY_METRICS_TSK_CREATEPROC');
+
+CREATE OR REPLACE PROCEDURE IDENTIFIER($procOBSERVABILITY_METRICS_TSK_CREATEPROC)()
+      RETURNS VARCHAR(16777216)
+      LANGUAGE JAVASCRIPT
+      EXECUTE AS CALLER
+    AS 
+    $$
+
+    var db_base_name = "_OBSERVABILITY_METRICS"; 
+    var schema_name = "OBSERVABILITY_CORE";
+    var schemaSetupProcedure = "SETUP_PROCEDURES_V1"; 
+           
+
+    var account_query = "SELECT CURRENT_ACCOUNT()";
+    var statement0 = snowflake.createStatement({sqlText: account_query});
+    var account = statement0.execute();
+    account.next();
+    account_name = account.getColumnValue(1);
+      
+    var query_db = `SELECT '`+ account_name + db_base_name + `'`;
+    var statement1 = snowflake.createStatement({sqlText: query_db});
+    var db = statement1.execute();
+    db.next();
+    db_name = db.getColumnValue(1);
+
+    var query2 = `
+      BEGIN
+        CREATE TASK IF NOT EXISTS ` + db_name + `.`+ schema_name + `.TSK_UPDATE_OBSERVABILITY_METRICS
+        WAREHOUSE = 'OBSERVABILITY_WH'
+        SCHEDULE = '1440 MINUTE'
+        AS
+          CALL ${db_name}.${schemaSetupProcedure}.OBSERVABILITY_METRICS_CREATE_PROCEDURE();
+          INSERT INTO ${db_name}.LOGGING_SCHEMA.LOGGING_TABLE
+          VALUES ('TSK_UPDATE_OBSERVABILITY_METRICS', 'SUCCESS', CURRENT_TIMESTAMP(), '` + account_name + `');
+          RETURN 'SUCCESS';
+        EXCEPTION
+          WHEN STATEMENT_ERROR THEN
+            LET ERROR_MESSAGE := CURRENT_TIMESTAMP()||SQLCODE || ': ' || SQLERRM;
+            INSERT INTO ${db_name}.LOGGING_SCHEMA.LOGGING_TABLE
+            VALUES ('TSK_UPDATE_OBSERVABILITY_METRICS', 'FAILED', :ERROR_MESSAGE, '` + account_name + `');
+            USE ROLE SYSADMIN;
+            USE WAREHOUSE COMPUTE_WH;
+            
+            RETURN OBJECT_CONSTRUCT('Error type', 'STATEMENT_ERROR',
+                                    'SQLCODE', SQLCODE,
+                                    'SQLERRM', SQLERRM,
+                                    'SQLSTATE', SQLSTATE);
+      END;`;
+
+      
+    var statement3 = snowflake.createStatement({sqlText: query2});
+        var result2 = statement3.execute()
+        result2.next()
+
+    var query3 = `ALTER TASK ` + db_name + `.` + schema_name + `.TSK_UPDATE_OBSERVABILITY_METRICS RESUME;`
+    var statement4 = snowflake.createStatement({sqlText: query3});
+        var result3 = statement4.execute()
+        result3.next()
+        return result2.getColumnValue(1),result3.getColumnValue(1) ;
+    $$;
+
+
+CALL IDENTIFIER($procOBSERVABILITY_METRICS_TSK_CREATEPROC)()
+/*Alerts skipped!!!*/
+
+
+-- serial:6 (code block H.a) COSTING METRICS
+
+/*calling Procedure Time: 10 Mins */
+
+--CALL OBSERVABILITY_SETUP.setup_procedures_v1.CHILD_OBSERVABILITY_METRICS_CREDITS_BY_QUERY_PROCEDURE();
+
+
+SET ProcSNOWFLAKE_COST_CREDITS_STD_CREATE_PROCEDURE = (SELECT $schemaSetupProcedure||'.SNOWFLAKE_COST_CREDITS_STD_CREATE_PROCEDURE');
+
+CREATE OR REPLACE PROCEDURE IDENTIFIER($ProcSNOWFLAKE_COST_CREDITS_STD_CREATE_PROCEDURE)()
+      RETURNS VARCHAR(16777216)
+      LANGUAGE JAVASCRIPT
+      EXECUTE AS CALLER
+      AS 
+      $$
+          var db_base_name = "OBSERVABILITY_METRICS";
+          var schema_name = "SNOWFLAKE_COST_STD";
+          
+          var account_query = "SELECT CURRENT_ACCOUNT()";
+          var statement = snowflake.createStatement({sqlText: account_query});
+          var account = statement.execute()
+          account.next();
+          var account_name = account.getColumnValue(1);
+          
+          var query_db = `SELECT CURRENT_ACCOUNT()||'_${db_base_name}'`
+          var statement1 = snowflake.createStatement({sqlText: query_db});
+          var db = statement1.execute();
+          db.next();
+          var db_name = db.getColumnValue(1);
+
+          var query1 = `
+              BEGIN 
+                  IF (EXISTS(SELECT * FROM `+db_name+`.` + schema_name + `.QUERY_COST_PARAMETERS)) THEN 
+                      RETURN 'No update needed to QUERY_COST_PARAMETERS';
+                  ELSE 
+                      INSERT INTO `+db_name+`.` + schema_name +`.QUERY_COST_PARAMETERS (PARAMETER_NAME, PARAM_VALUE_TIMESTAMP)
+                      VALUES ('query_start_time','2022-10-01'::timestamp_ltz);
+                      RETURN 'Successful update to QUERY_COST_PARAMETERS';
+                  END IF;
+              END;`
+          var statement2 = snowflake.createStatement({sqlText: query1});
+          var result1 = statement2.execute();
+          result1.next();
+
+          var query2 = ` 
+              DECLARE 
+              START_TIME TIMESTAMP_LTZ; --DEFAULT DATE_TRUNC('HOUR', DATEADD('DAY', -25, CURRENT_TIMESTAMP()));
+              END_TIME TIMESTAMP_LTZ; --DEFAULT DATE_TRUNC('HOUR', DATEADD('HOUR', -4, CURRENT_TIMESTAMP()));
+              TIME_INTERVAL VARCHAR DEFAULT 'HOUR';
+              ROWCOUNT NUMBER;
+              
+              BEGIN
+              SELECT DATEADD('DAY', -7, PARAM_VALUE_TIMESTAMP) AS LAST_QUERY_START_TIMESTAMP
+              , DATE_TRUNC(:TIME_INTERVAL,DATEADD('HOUR',-4,CURRENT_TIMESTAMP()))::TIMESTAMP_LTZ AS END_TIME
+              INTO :START_TIME, :END_TIME
+              FROM `+db_name+`.` + schema_name +`.QUERY_COST_PARAMETERS
+              WHERE PARAMETER_NAME = 'query_start_time'
+              ORDER BY PARAM_VALUE_TIMESTAMP DESC
+              LIMIT 1;;
+              
+              DELETE FROM `+db_name+`.` + schema_name +`.SF_CREDITS_BY_QUERY_NEW WHERE START_SLICE >= :START_TIME;
+              
+              ROWCOUNT := (SELECT DATEDIFF(:TIME_INTERVAL, :START_TIME, :END_TIME));
+              
+              INSERT INTO `+db_name+`.` + schema_name +`.SF_CREDITS_BY_QUERY_NEW (
+                    ACCOUNT_NAME,
+                    QUERY_ID,
+                      START_SLICE,
+                      ADJUSTED_START_TIME,
+                      START_TIME,
+                      END_TIME,
+                      QUERY_TYPE,
+                      QUERY_TEXT,
+                      QUERY_TAG,
+                      BYTES_SPILLED_TO_LOCAL_STORAGE,
+                      BYTES_SPILLED_TO_REMOTE_STORAGE,
+                      DATABASE_ID,
+                      DATABASE_NAME,
+                      SCHEMA_NAME,
+                      SESSION_ID,
+                      USER_NAME,
+                      ROLE_NAME,
+                      WAREHOUSE_NAME,
+                      WAREHOUSE_ID,
+                      WAREHOUSE_SIZE,
+                      WAREHOUSE_TYPE,
+                      CLUSTER_NUMBER,
+                      TOTAL_ELAPSED_TIME,
+                      TOTAL_QUEUE_TIME,
+                      TRANSACTION_BLOCKED_TIME,
+                      COMPILATION_TIME,
+                      DERIVED_ELAPSED_TIME_MS,
+                      ELAPSED_TIME_RATIO,
+                      ALLOCATED_CREDITS_USED,
+                      ALLOCATED_CREDITS_USED_COMPUTE,
+                      ALLOCATED_CREDITS_USED_CLOUD_SERVICES
+                  )
+              WITH TIME_SLICE_BY_INTERVAL AS (
+                  SELECT
+                      SEQ4() AS SEQ_NUM,
+                      ROW_NUMBER() OVER (
+                          ORDER BY
+                              SEQ_NUM
+                      ) AS INDEX,
+                      :ROWCOUNT + 1 - INDEX ROW_SEQ_NUM,
+                      DATEADD(
+                          :TIME_INTERVAL,
+                          -1 * INDEX,
+                          :END_TIME)::TIMESTAMP_LTZ AS START_SLICE,
+                          DATEADD(:TIME_INTERVAL, 1, START_SLICE) AS END_SLICE
+                          FROM
+                              TABLE(GENERATOR(ROWCOUNT =>(:ROWCOUNT)))
+                      ),
+                      SF_WAREHOUSE_METERING_HISTORY AS(
+                          SELECT
+                              START_TIME,
+                              WAREHOUSE_ID,
+                              WAREHOUSE_NAME,
+                              CREDITS_USED,
+                              CREDITS_USED_COMPUTE,
+                              CREDITS_USED_CLOUD_SERVICES
+                          FROM
+                              SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+                          WHERE
+                              START_TIME >= :START_TIME
+                              AND START_TIME < :END_TIME
+                              AND WAREHOUSE_ID != 0 --DON'T PULL CLOUD SERVICES RECORDS, THESE CAN'T BE TIED TO A QUERY
+                      ),
+                      SF_QUERY_HISTORY AS (
+                          SELECT
+                              DATABASE_ID,
+                              DATABASE_NAME,
+                              SCHEMA_NAME,
+                              QUERY_TYPE,
+                              USER_NAME,
+                              ROLE_NAME,
+                              WAREHOUSE_ID,
+                              WAREHOUSE_NAME,
+                              WAREHOUSE_SIZE,
+                              CLUSTER_NUMBER,
+                              QUERY_TAG,
+                              START_TIME,
+                              END_TIME,
+                              SESSION_ID,
+                              TOTAL_ELAPSED_TIME,
+                              CREDITS_USED_CLOUD_SERVICES,
+                              QUEUED_PROVISIONING_TIME,
+                              QUEUED_REPAIR_TIME,
+                              QUEUED_OVERLOAD_TIME,
+                              QUERY_ID,
+                              QUERY_TEXT,
+                              BYTES_SPILLED_TO_LOCAL_STORAGE,
+                              BYTES_SPILLED_TO_REMOTE_STORAGE,
+                              
+                              WAREHOUSE_TYPE,
+                              COALESCE(Q.QUEUED_PROVISIONING_TIME, 0) + COALESCE(Q.QUEUED_REPAIR_TIME, 0) + COALESCE(Q.QUEUED_OVERLOAD_TIME, 0) AS TOTAL_QUEUE_TIME,
+                              COALESCE(TRANSACTION_BLOCKED_TIME,0) AS TRANSACTION_BLOCKED_TIME, 
+                              COMPILATION_TIME,
+                              DATEADD(
+                                  'MILLISECOND',(TOTAL_QUEUE_TIME+COALESCE(Q.TRANSACTION_BLOCKED_TIME,0)+COALESCE(COMPILATION_TIME,0)),
+                                  Q.START_TIME )::TIMESTAMP_LTZ AS ADJUSTED_START_TIME,
+                                  DATE_TRUNC(:TIME_INTERVAL, ADJUSTED_START_TIME) AS ADJUSTED_START_INTERVAL
+                                  FROM
+                                      SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY Q
+                                  WHERE Q.START_TIME >= DATEADD('DAY',-7, :START_TIME)
+                                      AND Q.START_TIME < :END_TIME 
+                                      AND WAREHOUSE_SIZE IS NOT NULL
+                                      AND QUERY_TYPE NOT IN (
+                                          'GET_FILES',
+                                          'LIST_FILES',
+                                          'PUT_FILES',
+                                          'REMOVE_FILES',
+                                          'ALTER SESSION',
+                                          'DESCRIBE',
+                                          'SHOW',
+                                          'USE'
+                                      ) 
+                              ), 
+                              QUERIES_BY_TIME_SLICE AS (
+                                  SELECT
+                                      QH.QUERY_ID,
+                                      QH.QUERY_TYPE,
+                                      QH.QUERY_TEXT,
+                                      QH.QUERY_TAG,
+                                      QH.BYTES_SPILLED_TO_LOCAL_STORAGE,
+                                      QH.BYTES_SPILLED_TO_REMOTE_STORAGE,
+                                      QH.DATABASE_ID,
+                                      QH.DATABASE_NAME,
+                                      QH.SCHEMA_NAME,
+                                      QH.SESSION_ID,
+                                      QH.USER_NAME,
+                                      QH.ROLE_NAME,
+                                      QH.WAREHOUSE_NAME,
+                                      QH.WAREHOUSE_ID,
+                                      QH.WAREHOUSE_SIZE,
+                                      QH.WAREHOUSE_TYPE,
+                                      QH.CLUSTER_NUMBER,
+                                      QH.START_TIME,
+                                      QH.END_TIME,
+                                      QH.TOTAL_ELAPSED_TIME,
+                                      QH.TOTAL_QUEUE_TIME,
+                                      QH.TRANSACTION_BLOCKED_TIME,
+                                      QH.COMPILATION_TIME,
+                                      QH.ADJUSTED_START_TIME,
+                                      DD.START_SLICE,
+                                      DATEDIFF(
+                                          'MILLISECOND',
+                                          GREATEST(DD.START_SLICE, QH.ADJUSTED_START_TIME),
+                                          LEAST(DD.END_SLICE, QH.END_TIME)
+                                      ) AS DERIVED_ELAPSED_TIME_MS,
+                                      RATIO_TO_REPORT(DERIVED_ELAPSED_TIME_MS::NUMBER(38, 8
+                              )
+                      ) OVER (
+                          PARTITION BY QH.WAREHOUSE_ID,
+                          DD.START_SLICE
+                      ) AS ELAPSED_TIME_RATIO
+                  FROM
+                      SF_QUERY_HISTORY QH
+                      INNER JOIN TIME_SLICE_BY_INTERVAL DD ON DD.END_SLICE 
+                                  BETWEEN QH.ADJUSTED_START_TIME
+                      AND DATEADD(:TIME_INTERVAL, 1, QH.END_TIME)
+                      /* ON QH.ADJUSTED_START_TIME < DD.END_SLICE
+                              AND DD.START_SLICE < QH.END_TIME*/
+                  WHERE
+                      DD.START_SLICE >= :START_TIME
+                      AND DD.START_SLICE < :END_TIME
+              )
+              SELECT
+                  CURRENT_ACCOUNT(),
+                  Q.QUERY_ID,
+                  COALESCE(Q.START_SLICE,WMH.START_TIME) AS START_SLICE, 
+                  Q.ADJUSTED_START_TIME,
+                  Q.START_TIME,
+                  Q.END_TIME,
+                  Q.QUERY_TYPE,
+                  Q.QUERY_TEXT,
+                  Q.QUERY_TAG,
+                  Q.BYTES_SPILLED_TO_LOCAL_STORAGE,
+                  Q.BYTES_SPILLED_TO_REMOTE_STORAGE,
+                  Q.DATABASE_ID,
+                  Q.DATABASE_NAME,
+                  Q.SCHEMA_NAME,
+                  Q.SESSION_ID,
+                  Q.USER_NAME,
+                  Q.ROLE_NAME,
+                  COALESCE(Q.WAREHOUSE_NAME, WMH.WAREHOUSE_NAME) WAREHOUSE_NAME,
+                  COALESCE(Q.WAREHOUSE_ID, WMH.WAREHOUSE_ID) WAREHOUSE_ID,
+                  Q.WAREHOUSE_SIZE,
+                  Q.WAREHOUSE_TYPE,
+                  Q.CLUSTER_NUMBER,
+                  Q.TOTAL_ELAPSED_TIME,
+                  Q.TOTAL_QUEUE_TIME,
+                  Q.TRANSACTION_BLOCKED_TIME,
+                  Q.COMPILATION_TIME,
+                  Q.DERIVED_ELAPSED_TIME_MS,
+                  Q.ELAPSED_TIME_RATIO,
+                  NVL(ELAPSED_TIME_RATIO, 1) * WMH.CREDITS_USED AS ALLOCATED_CREDITS_USED,
+                  NVL(ELAPSED_TIME_RATIO, 1) * WMH.CREDITS_USED_COMPUTE AS ALLOCATED_CREDITS_USED_COMPUTE,
+                  NVL(ELAPSED_TIME_RATIO, 1) * WMH.CREDITS_USED_CLOUD_SERVICES AS ALLOCATED_CREDITS_USED_CLOUD_SERVICES
+              FROM
+                  SF_WAREHOUSE_METERING_HISTORY WMH
+                  LEFT OUTER JOIN QUERIES_BY_TIME_SLICE Q ON WMH.WAREHOUSE_NAME = Q.WAREHOUSE_NAME
+                  AND WMH.WAREHOUSE_ID = Q.WAREHOUSE_ID
+                  AND Q.START_SLICE BETWEEN WMH.START_TIME AND DATEADD('MILLISECOND',-1, DATEADD('HOUR',1,WMH.START_TIME))
+                  --AND WMH.START_TIME = Q.START_HOUR
+              ORDER BY
+                  WMH.START_TIME;
+              
+              UPDATE `+db_name+`.` + schema_name +`.QUERY_COST_PARAMETERS 
+              SET PARAM_VALUE_TIMESTAMP =:END_TIME::TIMESTAMP_LTZ
+              WHERE PARAMETER_NAME = 'query_start_time';
+              
+              INSERT INTO `+db_name+`.` + schema_name + `.CREDITS_ALLOCATION_VALIDATION_RESULTS(
+                  CREATED_AT_TS, START_TIME, END_TIME, SOURCE_DATA_SOURCE, TARGET_DATA_SOURCE, 
+                  SOURCE_CREDITS_USED, TARGET_CREDITS_USED, METERING_HOUR_MIN, METERING_HOUR_MAX, START_SLICE_MIN, START_SLICE_MAX,
+                  CREDITS_USED_DIFF, METERING_HOUR_MIN_DIFF_SECONDS, METERING_HOUR_MAX_DIFF_SECONDS) 
+              WITH SRC AS (
+                  SELECT 'ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY' AS DATA_SOURCE
+                      , SUM(CREDITS_USED) CREDITS_USED 
+                      , MIN(START_TIME) AS METERING_HOUR_MIN
+                      , MAX(START_TIME) AS METERING_HOUR_MAX 
+                  FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+                  WHERE START_TIME >= :START_TIME 
+                  AND START_TIME < :END_TIME 
+                  AND WAREHOUSE_ID != 0
+                  GROUP BY 1 
+              ), 
+              TGT AS (
+                  SELECT 'SF_CREDITS_BY_QUERY' AS DATA_SOURCE
+                      , SUM(ALLOCATED_CREDITS_USED) ALLOCATED_CREDITS_USED_SUM 
+                      , MIN(START_SLICE) AS START_SLICE_MIN 
+                      , MAX(START_SLICE) AS START_SLICE_MAX 
+                  FROM  `+db_name+`.` + schema_name +`.SF_CREDITS_BY_QUERY_NEW
+                  WHERE START_SLICE >= :START_TIME 
+                  AND START_SLICE < :END_TIME 
+                  AND WAREHOUSE_ID != 0 
+                  GROUP BY 1 
+              )
+              SELECT 
+                  CURRENT_TIMESTAMP AS CREATED_AT_TS
+                  , :START_TIME AS START_TIME 
+                  , :END_TIME AS END_TIME 
+                  , S.DATA_SOURCE AS SOURCE_DATA_SOURCE
+                  , T.DATA_SOURCE AS TARGET_DATA_SOURCE
+                  , ROUND(S.CREDITS_USED,4) AS SOURCE_CREDITS_USED 
+                  , ROUND(T.ALLOCATED_CREDITS_USED_SUM,4) AS TARGET_CREDITS_USED 
+                  , S.METERING_HOUR_MIN
+                  , S.METERING_HOUR_MAX
+                  , T.START_SLICE_MIN
+                  , T.START_SLICE_MAX
+                  , COALESCE(SOURCE_CREDITS_USED,0) - COALESCE(TARGET_CREDITS_USED,0) AS CREDITS_USED_DIFF
+                  , DATEDIFF('SECOND', S.METERING_HOUR_MIN, T.START_SLICE_MIN) AS METERING_HOUR_MIN_DIFF_SECONDS
+                  , DATEDIFF('SECOND', S.METERING_HOUR_MAX, T.START_SLICE_MAX) AS METERING_HOUR_MAX_DIFF_SECONDS
+              FROM SRC S
+              CROSS JOIN TGT T
+              ;
+              
+              RETURN ('ROWCOUNT:'||ROWCOUNT|| ' START_TIME:'||START_TIME||' END_TIME:'||END_TIME);
+              
+              EXCEPTION
+                WHEN STATEMENT_ERROR THEN
+                  RETURN OBJECT_CONSTRUCT('ERROR TYPE','STATEMENT_ERROR',
+                                          'SQLCODE', SQLCODE,
+                                          'SQLERRM' , SQLERRM,
+                                          'SQLSTATE', SQLSTATE);
+                WHEN OTHER THEN
+                  RETURN OBJECT_CONSTRUCT('ERROR TYPE', 'OTHER ERROR',
+                                          'SQLCODE', SQLCODE,
+                                          'SQLERRM', SQLERRM,
+                                          'SQLSTATE', SQLSTATE);
+              
+              END;`
+          var statement3 = snowflake.createStatement({sqlText: query2});
+          var result2 = statement3.execute();
+          result2.next();
+          return result2.getColumnValue(1);
+    $$;
+
+    
+CALL IDENTIFIER($ProcSNOWFLAKE_COST_CREDITS_STD_CREATE_PROCEDURE)()
+
+
+--serial:7 (code block H.b) TASK-COSTING METRICS
+
+--call OBSERVABILITY_SETUP.setup_procedures_v1.CHILD_OBSERVABILITY_METRICS_CREDITS_BY_QUERY();
+
+SET ProcSNOWFLAKE_COST_CREDITS_STD_TSK_CREATEPROC = (SELECT $schemaSetupProcedure||'.SNOWFLAKE_COST_CREDITS_STD_TSK_CREATEPROC');
+
+CREATE OR REPLACE PROCEDURE IDENTIFIER($ProcSNOWFLAKE_COST_CREDITS_STD_TSK_CREATEPROC)()
+    RETURNS VARCHAR(16777216)
+    LANGUAGE JAVASCRIPT
+    EXECUTE AS CALLER
+    AS 
+    $$
+        var db_base_name = "OBSERVABILITY_METRICS";
+        var schema_name = "SNOWFLAKE_COST_STD"; 
+        var version_schema = "SETUP_PROCEDURES_V1";
+        
+        var account_query = "SELECT CURRENT_ACCOUNT()";
+        var statement = snowflake.createStatement({sqlText: account_query});
+        var account = statement.execute()
+        account.next();
+        var account_name = account.getColumnValue(1);
+        
+        var query_db = `SELECT CURRENT_ACCOUNT()||'_${db_base_name}'`
+        var statement1 = snowflake.createStatement({sqlText: query_db});
+        var db = statement1.execute();
+        db.next();
+        var db_name = db.getColumnValue(1);
+
+        var query3 = `
+        BEGIN
+        CREATE TASK IF NOT EXISTS ` + db_name +`.`+ schema_name +`.TSK_UPDATE_COST_CREDITMETRICS
+        WAREHOUSE = "OBSERVABILITY_WH"
+        SCHEDULE = "300 MINUTE"
+        AS
+        CALL ${db_name}.${version_schema}.SNOWFLAKE_COST_CREDITS_STD_CREATE_PROCEDURE();
+        INSERT INTO ${db_name}.LOGGING_SCHEMA.LOGGING_TABLE
+        VALUES ('SNOWFLAKE_COST_CREDITS_STD_CREATE_PROCEDURE','SUCCESS', CURRENT_TIMESTAMP(), '`+account_name+`');
+        RETURN 'SUCESS';
+        EXCEPTION
+          WHEN STATEMENT_ERROR THEN 
+            LET ERROR_MESSAGE := CURRENT_TIMESTAMP()||sqlcode || ': '||sqlerrm;
+            INSERT INTO ${db_name}.LOGGING_SCHEMA.LOGGING_TABLE
+            VALUES('SNOWFLAKE_COST_CREDITS_STD_CREATE_PROCEDURE','FAILED', :ERROR_MESSAGE,'`+account_name+`' );
+            USE ROLE SYSADMIN;
+            USE WAREHOUSE COMPUTE_WH;
+
+            RETURN OBJECT_CONSTRUCT('ERROR TYPE','STATEMENT_ERROR',
+                                      'SQLCODE', sqlcode,
+                                      'SQLERRM' , sqlerrm,
+                                      'SQLSTATE', sqlstate);
+        END;`
+      var statement4 = snowflake.createStatement({sqlText: query3});
+          var result3 = statement4.execute()
+          result3.next()
+
+      var query4 = `ALTER TASK ` + db_name + `.` + schema_name + `.TSK_UPDATE_COST_CREDITMETRICS RESUME;`
+      var statement5 = snowflake.createStatement({sqlText: query4});
+          var result4 = statement5.execute()
+          result4.next()
+          return result3.getColumnValue(1).concat(" " ,result4.getColumnValue(1)) ;
+    $$;
+
+CALL IDENTIFIER($ProcSNOWFLAKE_COST_CREDITS_STD_TSK_CREATEPROC)();
+
+EXECUTE TASK JSA18243_OBSERVABILITY_METRICS.SNOWFLAKE_COST_STD.TSK_UPDATE_COST_CREDITMETRICS; --CUSTOMIZE
+
+--serial:8 (code block I.a) OBSERVABILITY METRICS
+
+--CALL OBSERVABILITY_SETUP.setup_procedures_v1.CHILD_OBSERVABILITY_METRICS_METRICS_CREATE_PROCEDURE();
+SET ProcSNOWFLAKE_COST_STORAGE_STD_CREATE_PROCEDURE = (SELECT $schemaSetupProcedure||'.SNOWFLAKE_COST_STORAGE_STD_CREATE_PROCEDURE');
+
+CREATE OR REPLACE PROCEDURE IDENTIFIER($ProcSNOWFLAKE_COST_STORAGE_STD_CREATE_PROCEDURE)()
+RETURNS VARCHAR(16777216)
+LANGUAGE JAVASCRIPT
+EXECUTE AS CALLER
+AS 
+$$
+var db_base_name = "OBSERVABILITY_METRICS";
+var schema_name = "SNOWFLAKE_COST_STD"; 
+
+var account_query = "SELECT CURRENT_ACCOUNT()";
+var statement = snowflake.createStatement({sqlText: account_query});
+var account = statement.execute();
+account.next();
+var account_name = account.getColumnValue(1);
+
+var query_db = `SELECT CURRENT_ACCOUNT() || '_${db_base_name}'`;
+var statement1 = snowflake.createStatement({sqlText: query_db});
+var db = statement1.execute();
+db.next();
+var db_name = db.getColumnValue(1);
+
+var query = `
+BEGIN
+INSERT INTO ${db_name}.${schema_name}.DB_STORAGE_CALC (
+SELECT USAGE_DATE,
+DATABASE_NAME,
+SUM(AVERAGE_DATABASE_BYTES)/1024/1024/1024/1024/1024 AS DATABASE_STORAGE_PETABYTES,
+SUM(AVERAGE_FAILSAFE_BYTES)/1024/1024/1024/1024/1024 AS FAILSAFE_STORAGE_PETABYTES,
+SUM(AVERAGE_HYBRID_TABLE_STORAGE_BYTES)/1024/1024/1024/1024/1024 AS HYBRID_STORAGE_PETABYTES,                  
+CURRENT_ACCOUNT()
+FROM SNOWFLAKE.ACCOUNT_USAGE.DATABASE_STORAGE_USAGE_HISTORY 
+WHERE MONTH(USAGE_DATE) IN (SELECT IFF(MONTH(DATEADD('MONTH',-1,CURRENT_DATE())) = 0, 12, MONTH(DATEADD('MONTH',0,CURRENT_DATE()))))  
+AND YEAR(USAGE_DATE) IN (SELECT IFF(MONTH(DATEADD('MONTH',-1,CURRENT_DATE())) = 0, YEAR(CURRENT_DATE())-1, YEAR(CURRENT_DATE()))) 
+GROUP BY USAGE_DATE, DATABASE_NAME 
+ORDER BY 1
+);
+
+INSERT INTO ${db_name}.${schema_name}.DAILY_STAGE_STORAGE (
+SELECT CURRENT_ACCOUNT(), 
+USAGE_DATE,
+AVERAGE_STAGE_BYTES 
+FROM SNOWFLAKE.ACCOUNT_USAGE.STAGE_STORAGE_USAGE_HISTORY
+WHERE USAGE_DATE BETWEEN (IFF((SELECT DATEADD('DAY',1,MAX(USAGE_DATE)) FROM ${db_name}.${schema_name}.DAILY_STAGE_STORAGE) IS NULL, (SELECT MIN(USAGE_DATE) FROM SNOWFLAKE.ACCOUNT_USAGE.STAGE_STORAGE_USAGE_HISTORY), (SELECT DATEADD('DAY',1,MAX(USAGE_DATE)) FROM ${db_name}.${schema_name}.DAILY_STAGE_STORAGE))) 
+AND (SELECT MAX(USAGE_DATE) FROM SNOWFLAKE.ACCOUNT_USAGE.STAGE_STORAGE_USAGE_HISTORY) 
+ORDER BY 2
+);
+
+INSERT INTO ${db_name}.${schema_name}.AUTOMATIC_CLUSTERING_WAREHOUSE_DTLS (
+SELECT CURRENT_ACCOUNT() AS ACCOUNT_NAME,  
+START_TIME, 
+END_TIME, 
+CREDITS_USED, 
+NUM_BYTES_RECLUSTERED, 
+NUM_ROWS_RECLUSTERED, 
+TABLE_ID, 
+TABLE_NAME, 
+SCHEMA_ID, 
+SCHEMA_NAME, 
+DATABASE_ID, 
+DATABASE_NAME 
+FROM SNOWFLAKE.ACCOUNT_USAGE.AUTOMATIC_CLUSTERING_HISTORY ACH
+WHERE START_TIME BETWEEN (IFF((SELECT DATEADD('DAY',1,MAX(START_TIME)) FROM ${db_name}.SNOWFLAKE_COST_STD.AUTOMATIC_CLUSTERING_WAREHOUSE_DTLS) IS NULL, (SELECT MIN(START_TIME) FROM SNOWFLAKE.ACCOUNT_USAGE.AUTOMATIC_CLUSTERING_HISTORY), (SELECT DATEADD('DAY',1,MAX(START_TIME)) FROM ${db_name}.${schema_name}.AUTOMATIC_CLUSTERING_WAREHOUSE_DTLS))) 
+AND (SELECT MAX(START_TIME) FROM SNOWFLAKE.ACCOUNT_USAGE.AUTOMATIC_CLUSTERING_HISTORY) 
+ORDER BY 2
+);
+RETURN 'SUCCESSFUL UPDATE';
+END;
+`;
+
+var statement2 = snowflake.createStatement({sqlText: query});
+var result = statement2.execute();
+result.next();
+return result.getColumnValue(1);
+$$;
+
+CALL IDENTIFIER($ProcSNOWFLAKE_COST_STORAGE_STD_CREATE_PROCEDURE)()
+
+
+--serial:9 (code block I.b) TASK-OBSERVABILITY METRICS
+
+SET ProcSNOWFLAKE_COST_STORAGE_STD_TSK_CREATEPROC = (SELECT $schemaSetupProcedure||'.SNOWFLAKE_COST_STORAGE_STD_TSK_CREATEPROC');
+
+CREATE OR REPLACE PROCEDURE IDENTIFIER($ProcSNOWFLAKE_COST_STORAGE_STD_TSK_CREATEPROC)()
+    RETURNS VARCHAR(16777216)
+    LANGUAGE JAVASCRIPT
+    EXECUTE AS CALLER
+    AS 
+    $$
+    var version_schema = "SETUP_PROCEDURES_V1";
+    var db_base_name =  "OBSERVABILITY_METRICS";
+    var schema_name = "SNOWFLAKE_COST_STD";
+        
+    var account_query = "SELECT CURRENT_ACCOUNT()";
+    var statement = snowflake.createStatement({sqlText: account_query});
+    var account = statement.execute();
+    account.next();
+    
+    var account_name = account.getColumnValue(1);
+    var query_db = `SELECT CURRENT_ACCOUNT()||'_${db_base_name}'`;
+    var statement1 = snowflake.createStatement({sqlText: query_db});
+    var db = statement1.execute();
+    db.next();
+    var db_name = db.getColumnValue(1);
+    
+    var query2 = `
+        BEGIN
+            CREATE TASK IF NOT EXISTS ` + db_name + `.` + schema_name + `.TSK_UPDATE_COST_STORAGEMETRICS
+            WAREHOUSE = "OBSERVABILITY_WH"
+            SCHEDULE = "1440 MINUTE"
+            AS
+            CALL ${db_name}.${version_schema}.SNOWFLAKE_COST_STORAGE_STD_CREATE_PROCEDURE();
+            INSERT INTO ${db_name}.LOGGING_SCHEMA.LOGGING_TABLE
+                VALUES ('SNOWFLAKE_COST_STORAGE_STD_CREATE_PROCEDURE', 'SUCCESS', CURRENT_TIMESTAMP(), '` + account_name + `');
+            RETURN 'SUCCESSFULLY CREATED ALERT AND INTEGRATION';
+        EXCEPTION
+        WHEN STATEMENT_ERROR THEN 
+            LET ERROR_MESSAGE := CURRENT_TIMESTAMP() || SQLCODE || ': ' || SQLERRM;
+            INSERT INTO ${db_name}.LOGGING_SCHEMA.LOGGING_TABLE
+                VALUES ('SNOWFLAKE_COST_STORAGE_STD_CREATE_PROCEDURE', 'FAILED', :ERROR_MESSAGE, '` + account_name + `');
+            USE ROLE SYSADMIN;
+            USE WAREHOUSE COMPUTE_WH;
+            
+            RETURN OBJECT_CONSTRUCT('ERROR TYPE', 'STATEMENT_ERROR',
+                                    'SQLCODE', SQLCODE,
+                                    'SQLERRM', SQLERRM,
+                                    'SQLSTATE', SQLSTATE);
+        END;
+    `;
+    
+    var statement3 = snowflake.createStatement({sqlText: query2});
+    var result2 = statement3.execute();
+    result2.next();
+    
+    var query3 = `ALTER TASK ` + db_name + `.` + schema_name +`.TSK_UPDATE_COST_STORAGEMETRICS RESUME;`;
+    var statement4 = snowflake.createStatement({sqlText: query3});
+    var result3 = statement4.execute();
+    result3.next();
+    
+    return result2.getColumnValue(1).concat(" ", result3.getColumnValue(1));
+    $$;
+
+--J FEDERATED CRON SETUP
+--to be done later
+--CUSTOMIZE
+
+SELECT * FROM JSA18243_OBSERVABILITY_METRICS.SNOWFLAKE_COST_STD.SF_CREDITS_BY_QUERY_NEW;
+SELECT * FROM JSA18243_OBSERVABILITY_METRICS.OBSERVABILITY_CORE.OBSERVABILITY_METRICS;
+
+/*Later change SF_CREDITS_BY_QUERY_NEW , remove NEW word*/
+
+
+--HOUSEKEEPING COMMANDS
+--CUSTOMIZE
+
+USE ROLE ACCOUNTADMIN;
+DROP DATABASE JSA18243_OBSERVABILITY_METRICS; 
+
+
+DROP WAREHOUSE OBSERVABILITY_WH;
+DROP ROLE OBSERVABILITY_ADMIN;
+
+DROP ROLE JSA18243_OBSERVABILITY_ADMIN;
+DROP ROLE JSA18243_OBSERVABILITY_DEV;
+DROP ROLE JSA18243_OBSERVABILITY_READER;
+
+DROP ROLE JSA18243_OBSERVABILITY_METRICS_ADMIN;
+DROP ROLE JSA18243_OBSERVABILITY_METRICS_DEV;
+DROP ROLE JSA18243_OBSERVABILITY_METRICS_READER;
+
+USE ROLE SYSADMIN;
